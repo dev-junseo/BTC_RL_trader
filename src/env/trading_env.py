@@ -183,12 +183,12 @@ class BTCTradingEnv(gym.Env):
         # 1) 로그 수익률
         log_return = np.log(curr_value / (prev_value + 1e-9))
 
-        # 2) MDD 페널티 (20% 초과 시)
+        # 2) MDD 페널티 (15% 초과 시 더 엄격하게 적용)
         if curr_value > self.peak_value:
             self.peak_value = curr_value
         drawdown          = (self.peak_value - curr_value) / (self.peak_value + 1e-9)
         self.max_drawdown = max(self.max_drawdown, drawdown)
-        drawdown_penalty  = max(0.0, (drawdown - 0.20)) * 2.0
+        drawdown_penalty  = max(0.0, (drawdown - 0.15)) * 5.0
 
         # 3) 포지션 변화 페널티 (잦은 거래 억제)
         position_pen = abs(actual_delta) * self.position_penalty
