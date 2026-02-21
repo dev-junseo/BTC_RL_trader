@@ -7,22 +7,24 @@ from gymnasium import spaces
 
 class BTCTradingEnv(gym.Env):
     """
-    비트코인 트레이딩 Gymnasium 환경 (v2)
+    비트코인 트레이딩 Gymnasium 환경 (v3)
 
-    v1 대비 개선사항:
-    - 거래 발동 임계값 통일 (매수/매도 모두 5%)
-    - 최대 포지션 80%로 제한 (현금 20% 항상 유지)
-    - 포지션 변화 페널티 추가 (잦은 거래 억제)
-    - 수수료 페널티 보상 함수에 직접 반영
+    v2 대비 개선사항:
+    - [핵심] 액션 → 포지션 변화량(delta) 방식으로 재설계
+      기존: action → 목표 포지션 절대값 (매도 경험 부족)
+      변경: action → 현재 포지션에서의 변화량 (매수/매도 균등 학습)
+    - 매도 시 실현 수익 보너스 추가
+    - 에피소드 시작 시 초기 포지션 랜덤화 (다양한 상황 학습)
 
     Parameters
     ----------
     df               : 피처가 포함된 DataFrame (close 컬럼 필수)
     initial_balance  : 초기 자본 (USDT)
     fee_rate         : 거래 수수료율 (기본 0.05%)
-    max_position     : 최대 포지션 비율 (기본 0.8 = 80%까지만 투자)
+    max_position     : 최대 포지션 비율 (기본 0.8)
     trade_threshold  : 거래 발동 최소 포지션 변화율 (기본 5%)
     position_penalty : 포지션 변화 페널티 강도 (기본 0.001)
+    random_start_pos : 에피소드 시작 시 랜덤 포지션 여부 (기본 True)
     """
 
     metadata = {'render_modes': ['human']}
@@ -33,8 +35,9 @@ class BTCTradingEnv(gym.Env):
         initial_balance=10_000.0,
         fee_rate=0.0005,
         max_position=0.8,
-        trade_threshold=0.05,    # ★ 버그3 수정: __init__에 추가
-        position_penalty=0.001,  # ★ 버그3 수정: __init__에 추가
+        trade_threshold=0.05,
+        position_penalty=0.001,
+        random_start_pos=True,
     ):
         super().__init__()
         self.df               = df.reset_index(drop=True)
@@ -43,6 +46,7 @@ class BTCTradingEnv(gym.Env):
         self.max_position     = max_position
         self.trade_threshold  = trade_threshold
         self.position_penalty = position_penalty
+        self.random_start_pos = random_start_pos
 
         assert 'close' in df.columns, "'close' 컬럼이 필요합니다."
         self.feature_cols  = [c for c in df.columns if c != 'close']
@@ -99,19 +103,34 @@ class BTCTradingEnv(gym.Env):
         return np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
 
     # ─────────────────────────────────────────────
-    #  거래 실행
+    #  거래 실행 (★ 핵심 변경: delta 방식)
     # ─────────────────────────────────────────────
     def _execute_trade(self, action, current_price):
-        portfolio_val = self._get_portfolio_value(current_price)
-        target_ratio  = np.clip((action + 1) / 2, 0.0, self.max_position)
-        current_ratio = (self.btc_held * current_price) / (portfolio_val + 1e-9)
-        delta_ratio   = target_ratio - current_ratio
-        fee           = 0.0
-        actual_delta  = 0.0  # ★ 버그1 수정: 초기값 명시
+        """
+        action [-1, 1] → 포지션 변화량(delta)으로 해석
+          action = +1.0 → 최대한 매수 (현재 포지션 + max_position)
+          action = -1.0 → 최대한 매도 (현재 포지션 - max_position)
+          action =  0.0 → 홀드
 
-        if delta_ratio > self.trade_threshold:        # ★ 버그2 수정: 매수 임계값 통일
+        이 방식의 장점:
+          포지션이 이미 있어도 매도 액션이 자연스럽게 작동
+          매수/매도 경험을 균등하게 학습 가능
+        """
+        portfolio_val  = self._get_portfolio_value(current_price)
+        current_ratio  = (self.btc_held * current_price) / (portfolio_val + 1e-9)
+
+        # ★ action을 절대 목표가 아닌 변화량으로 해석
+        delta          = action * self.max_position        # [-0.8, +0.8]
+        target_ratio   = np.clip(current_ratio + delta, 0.0, self.max_position)
+        delta_ratio    = target_ratio - current_ratio
+
+        fee            = 0.0
+        actual_delta   = 0.0
+        realized_pnl   = 0.0
+
+        if delta_ratio > self.trade_threshold:             # 매수
             buy_amount = min(portfolio_val * delta_ratio, self.balance)
-            if buy_amount > 1.0:                      # 최소 거래 금액 $1
+            if buy_amount > 1.0:
                 fee           = buy_amount * self.fee_rate
                 btc_bought    = (buy_amount - fee) / current_price
                 total_btc     = self.btc_held + btc_bought
@@ -124,39 +143,43 @@ class BTCTradingEnv(gym.Env):
                 self.balance     -= buy_amount
                 self.trade_count += 1
                 self.hold_steps   = 0
-                actual_delta      = delta_ratio       # ★ 버그1 수정: 실제 변화량 저장
+                actual_delta      = delta_ratio
 
-        elif delta_ratio < -self.trade_threshold:     # ★ 버그2 수정: 매도 임계값 통일
+        elif delta_ratio < -self.trade_threshold:          # 매도
             sell_ratio  = min(abs(delta_ratio) / (current_ratio + 1e-9), 1.0)
             btc_to_sell = self.btc_held * sell_ratio
-            if btc_to_sell * current_price > 1.0:    # 최소 거래 금액 $1
-                sell_amount   = btc_to_sell * current_price
-                fee           = sell_amount * self.fee_rate
+            if btc_to_sell * current_price > 1.0:
+                sell_amount  = btc_to_sell * current_price
+                fee          = sell_amount * self.fee_rate
                 self.balance += sell_amount - fee
                 self.btc_held -= btc_to_sell
+
+                # ★ 실현 손익 계산 (매도 보너스용)
+                if self.avg_buy_price > 0:
+                    realized_pnl = (current_price - self.avg_buy_price) / self.avg_buy_price
+
                 if self.btc_held < 1e-8:
                     self.btc_held      = 0.0
                     self.avg_buy_price = 0.0
                     self.hold_steps    = 0
-                self.trade_count += 1
-                actual_delta      = delta_ratio       # ★ 버그1 수정: 실제 변화량 저장
 
-        else:
+                self.trade_count += 1
+                actual_delta      = delta_ratio
+
+        else:                                              # 홀드
             self.hold_steps += 1
             actual_delta     = 0.0
 
         self.total_fees    += fee
-
-        # ★ 버그4 수정: 중복 제거 (한 번만 계산)
         new_val             = self._get_portfolio_value(current_price)
         self.position_ratio = (self.btc_held * current_price) / (new_val + 1e-9)
 
-        return actual_delta
+        return actual_delta, realized_pnl
 
     # ─────────────────────────────────────────────
-    #  보상 함수
+    #  보상 함수 (★ 매도 수익 보너스 추가)
     # ─────────────────────────────────────────────
-    def _compute_reward(self, prev_value, curr_value, actual_delta, fee_paid):
+    def _compute_reward(self, prev_value, curr_value, actual_delta, fee_paid, realized_pnl):
         # 1) 로그 수익률
         log_return = np.log(curr_value / (prev_value + 1e-9))
 
@@ -173,18 +196,32 @@ class BTCTradingEnv(gym.Env):
         # 4) 수수료 페널티
         fee_penalty  = (fee_paid / (curr_value + 1e-9)) * 10.0
 
+        # 5) ★ 수익 실현 보너스 (이익 매도 장려)
+        profit_bonus = max(0.0, realized_pnl) * 0.1
+
         self.returns_history.append(log_return)
         if len(self.returns_history) > 24:
             self.returns_history.pop(0)
 
-        return float(log_return - drawdown_penalty - position_pen - fee_penalty)
+        return float(log_return - drawdown_penalty - position_pen - fee_penalty + profit_bonus)
 
     # ─────────────────────────────────────────────
-    #  Reset
+    #  Reset (★ 랜덤 초기 포지션 추가)
     # ─────────────────────────────────────────────
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self._reset_state()
+
+        # ★ 랜덤 초기 포지션 (학습 환경에서만 True로 설정)
+        if self.random_start_pos:
+            init_price     = self.df.loc[0, 'close']
+            init_position  = float(self.np_random.uniform(0.0, 0.5))
+            buy_amount     = self.initial_balance * init_position
+            self.btc_held       = buy_amount / init_price
+            self.balance        = self.initial_balance - buy_amount
+            self.avg_buy_price  = init_price
+            self.position_ratio = init_position
+
         return self._get_observation(), {}
 
     # ─────────────────────────────────────────────
@@ -194,22 +231,25 @@ class BTCTradingEnv(gym.Env):
         action        = float(np.clip(action, -1.0, 1.0))
         current_price = self.df.loc[self.current_step, 'close']
         prev_value    = self._get_portfolio_value(current_price)
-        prev_fees     = self.total_fees  # 거래 전 수수료 저장
+        prev_fees     = self.total_fees
 
-        actual_delta  = self._execute_trade(action, current_price)
+        # ★ 튜플 반환 (actual_delta, realized_pnl)
+        actual_delta, realized_pnl = self._execute_trade(action, current_price)
 
         self.current_step += 1
         terminated    = self.current_step >= len(self.df) - 1
         next_price    = self.df.loc[self.current_step, 'close']
         curr_value    = self._get_portfolio_value(next_price)
-        fee_paid      = self.total_fees - prev_fees  # 이번 거래 수수료
+        fee_paid      = self.total_fees - prev_fees
 
         self.portfolio_values.append(curr_value)
 
         if curr_value < self.initial_balance * 0.05:
             terminated = True
 
-        reward = self._compute_reward(prev_value, curr_value, actual_delta, fee_paid)
+        reward = self._compute_reward(
+            prev_value, curr_value, actual_delta, fee_paid, realized_pnl
+        )
 
         info = {
             'step'           : self.current_step,
